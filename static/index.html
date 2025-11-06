@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>GyanNidhi – WebRTC AI Interview</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .2rem; }
+    p  { margin-top: 0; color: #666; }
+    .row { margin: 1rem 0; }
+    button { padding: .6rem 1rem; margin-right: .5rem; cursor: pointer; }
+    #log { background:#f7f7f8; border:1px solid #e6e6e6; padding:1rem; border-radius:8px; white-space:pre-wrap; min-height: 160px; }
+    audio { display:block; margin: 1rem 0; width: 100%; }
+    label { display:inline-block; margin-right: .5rem; }
+  </style>
+</head>
+<body>
+  <h1>WebRTC AI Interview — PCB Designer</h1>
+  <p>Click Start to grant mic access. The AI will speak and listen in real time.</p>
+
+  <div class="row">
+    <button id="start">Start Interview</button>
+    <button id="stop" disabled>Stop</button>
+    <label><input type="checkbox" id="textMode"> Also request text responses</label>
+  </div>
+
+  <audio id="remoteAudio" autoplay></audio>
+
+  <h3>Console</h3>
+  <div id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(s){ logEl.textContent += s + "\n"; }
+
+    let pc, localStream, eventsChannel, textChannel;
+
+    async function startInterview() {
+      document.getElementById('start').disabled = true;
+
+      // 1) Fetch ephemeral token from your backend
+      let session;
+      try {
+        const r = await fetch('/session');
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        session = await r.json();
+      } catch (e) {
+        log("Failed to create session: " + e.message);
+        document.getElementById('start').disabled = false;
+        return;
+      }
+
+      const token = session?.client_secret?.value;
+      const model = session?.model || "gpt-4o-realtime-preview";
+      if (!token) {
+        log("No ephemeral token in /session response.");
+        document.getElementById('start').disabled = false;
+        return;
+      }
+      log("Ephemeral token acquired.");
+
+      // 2) WebRTC peer connection
+      pc = new RTCPeerConnection({
+        // iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }]
+      });
+
+      // Remote audio from model
+      const remoteAudio = document.getElementById('remoteAudio');
+      pc.ontrack = (e) => {
+        remoteAudio.srcObject = e.streams[0];
+      };
+
+      // Datachannel created by us → send events to model
+      eventsChannel = pc.createDataChannel("oai-events");
+      eventsChannel.onopen = () => {
+        log("Events channel open.");
+        // Kick off interview: ask model to start speaking
+        const wantText = document.getElementById('textMode').checked;
+        eventsChannel.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            instructions: "Begin the interview now. Greet briefly and ask the first concise question on Ki Cad or Altium experience.",
+            modalities: wantText ? ["audio","text"] : ["audio"]
+          }
+        }));
+      };
+      eventsChannel.onmessage = (ev) => log("events ← " + ev.data);
+
+      // Optional: model may open its own channels; also we make one for plain text messages
+      pc.ondatachannel = (ev) => {
+        const ch = ev.channel;
+        // OpenAI typically names its event channel "oai-events" too, but handle all:
+        if (!textChannel && ch.label !== "oai-events") {
+          textChannel = ch;
+          textChannel.onmessage = (msg) => {
+            // If you asked for text modality, you'll see text chunks here
+            log("text ← " + msg.data);
+          };
+        }
+      };
+
+      // 3) Send mic to model
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        log("Mic access denied: " + e.message);
+        document.getElementById('start').disabled = false;
+        return;
+      }
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      // 4) Offer/Answer with OpenAI Realtime
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
+      await pc.setLocalDescription(offer);
+
+      const resp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/sdp"
+        },
+        body: offer.sdp
+      });
+
+      if (!resp.ok) {
+        log("Realtime SDP failed: " + resp.status + " " + (await resp.text()));
+        document.getElementById('start').disabled = false;
+        return;
+      }
+
+      const answerSdp = await resp.text();
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
+      log("Connected. Speak normally; the AI will respond in voice.");
+      document.getElementById('stop').disabled = false;
+    }
+
+    async function stopInterview() {
+      try { if (eventsChannel && eventsChannel.readyState === "open") eventsChannel.close(); } catch {}
+      try { if (textChannel && textChannel.readyState === "open") textChannel.close(); } catch {}
+      try { if (pc) await pc.close(); } catch {}
+      try { if (localStream) localStream.getTracks().forEach(t => t.stop()); } catch {}
+
+      document.getElementById('start').disabled = false;
+      document.getElementById('stop').disabled = true;
+      log("Stopped.");
+    }
+
+    document.getElementById('start').onclick = startInterview;
+    document.getElementById('stop').onclick = stopInterview;
+  </script>
+</body>
+</html>
