@@ -1,53 +1,59 @@
 import os
-import httpx
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from typing import Dict, Any
 
-# --------- CONFIG ----------
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse
+import httpx
+
+# ---------------------------
+# Config
+# ---------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY in Render dashboard.")
+    raise RuntimeError("Set OPENAI_API_KEY in your environment.")
 
-MODEL_REALTIME = os.getenv("MODEL_REALTIME", "gpt-4o-realtime-preview")
+REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 VOICE = os.getenv("VOICE", "alloy")
 
-app = FastAPI()
+app = FastAPI(title="WebRTC Interview – Python Server")
 
-# serve / and /static/*
+# Serve ./static (index.html, client JS inlined)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
-def root():
+async def root():
+    # Serve your main page
     return FileResponse("static/index.html")
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/session")
-async def create_realtime_session():
+@app.post("/session")
+async def create_ephemeral_session(_: Request) -> JSONResponse:
     """
-    Create a short-lived client token for the browser to connect to OpenAI Realtime via WebRTC.
+    Issues an OpenAI Realtime **ephemeral** key for the browser.
+    The browser will use this to make a direct WebRTC connection to OpenAI.
     """
     url = "https://api.openai.com/v1/realtime/sessions"
+    payload: Dict[str, Any] = {
+        "model": REALTIME_MODEL,
+        # Force English-only + TTS voice
+        "voice": VOICE,
+        "instructions": "You are a structured technical interviewer. Respond ONLY in English.",
+        # Ensure audio+text output is available by default
+        "modalities": ["audio", "text"],
+        # Lock STT to English
+        "input_audio_transcription": {"model": "whisper-1", "language": "en"},
+    }
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
+        "OpenAI-Beta": "realtime=v1"
     }
-    payload = {
-        "model": MODEL_REALTIME,
-        "voice": VOICE,
-        "instructions": (
-            "You are a structured technical interviewer for the role 'PCB Designer'. "
-            "Speak naturally in short sentences. Ask exactly one concise question at a time "
-            "(under 20 words). Keep the conversation voice-friendly and interactive. "
-            "If the user is silent for a while, gently prompt them."
-        ),
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=payload)
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(url, json=payload, headers=headers)
         r.raise_for_status()
         data = r.json()
-    # The JSON includes client_secret.value (ephemeral token) and model name
+
+    # Return the whole session object (contains client_secret)
     return JSONResponse(data)
