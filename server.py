@@ -1,17 +1,16 @@
+# server.py
 import os
-from typing import Dict, Any
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 
-# ===== Config =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY env var")
+    raise RuntimeError("Set OPENAI_API_KEY")
 
-# If your account doesn’t have access to the Realtime preview you picked,
-# you’ll get a 404/403 from OpenAI. Try another, e.g. "gpt-4o-realtime-preview".
+# Use a model your account actually has access to.
+# Common options: "gpt-4o-realtime-preview"
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 VOICE = os.getenv("VOICE", "alloy")
 
@@ -30,76 +29,41 @@ async def root():
 
 @app.get("/health")
 async def health():
-    ok = bool(OPENAI_API_KEY)
-    return {"ok": ok, "model": REALTIME_MODEL, "voice": VOICE}
+    return {"ok": bool(OPENAI_API_KEY), "model": REALTIME_MODEL, "voice": VOICE}
 
 @app.post("/session")
-async def create_ephemeral_session(req: Request):
+async def create_ephemeral_session():
     """
-    Issues an ephemeral key for browser Realtime.
-    Returns upstream errors verbatim so the client can display them.
+    Create an ephemeral Realtime session for the browser.
+    IMPORTANT: Only send fields the endpoint supports.
     """
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
-
-    role = (body.get("role") or DEFAULT_ROLE).strip()
-    opening = (body.get("opening") or DEFAULT_OPENING).strip()
-
-    instructions = f"""
-You are a structured technical interviewer for the role: {role}.
-Rules:
-1) Speak ONLY the question aloud (audio). Do not speak analysis.
-2) Keep each question < 20 words, voice-friendly.
-3) After speaking, send a TEXT-only block with EXACT JSON tagged as:
-[ANALYSIS_JSON] {{"analysis":"...", "reasoning_focus":"...", "quality_signals":"..."}}
-No extra commentary outside JSON. Keep analysis concise (1–2 sentences).
-4) Continue as a conversational interviewer: listen to candidate's voice, then ask the next question.
-"""
-
-    payload: Dict[str, Any] = {
-        "model": REALTIME_MODEL,
-        "voice": VOICE,
-        "instructions": instructions,
-        "modalities": ["audio", "text"],
-        "input_audio_transcription": {"model": "whisper-1", "language": "en"},
-        "conversation": {
-            "messages": [
-                {"role": "user", "content": f"Start the interview. First question: {opening}"}
-            ]
-        },
-        # Optionally tighten TTL:
-        # "expires_in": 60,
-    }
-
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
         "OpenAI-Beta": "realtime=v1",
     }
+    payload = {
+        "model": REALTIME_MODEL,
+        # optional:
+        "voice": VOICE,
+        # "expires_in": 60,  # optional TTL seconds
+    }
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
+            r = await client.post(
                 "https://api.openai.com/v1/realtime/sessions",
                 json=payload,
                 headers=headers,
             )
     except httpx.RequestError as e:
-        # Network/SSL/DNS errors
-        return JSONResponse(
-            {"error": "request_error", "detail": str(e)},
-            status_code=502,
-        )
+        return JSONResponse({"error": "request_error", "detail": str(e)}, status_code=502)
 
-    # Pass through OpenAI’s exact response if it’s not 2xx
-    if resp.status_code // 100 != 2:
-        # Try JSON; fall back to text
-        content_type = resp.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return JSONResponse(resp.json(), status_code=resp.status_code)
-        else:
-            return PlainTextResponse(resp.text, status_code=resp.status_code)
+    # Pass through upstream response if non-2xx so the UI shows the true error.
+    if r.status_code // 100 != 2:
+        ctype = r.headers.get("content-type", "")
+        if "application/json" in ctype:
+            return JSONResponse(r.json(), status_code=r.status_code)
+        return PlainTextResponse(r.text, status_code=r.status_code)
 
-    return JSONResponse(resp.json())
+    return JSONResponse(r.json())
