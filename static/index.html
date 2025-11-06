@@ -1,154 +1,172 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>GyanNidhi – WebRTC AI Interview</title>
+  <meta charset="utf-8"/>
+  <title>WebRTC Interview (Python)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, sans-serif; max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
-    h1 { margin-bottom: .2rem; }
-    p  { margin-top: 0; color: #666; }
-    .row { margin: 1rem 0; }
-    button { padding: .6rem 1rem; margin-right: .5rem; cursor: pointer; }
-    #log { background:#f7f7f8; border:1px solid #e6e6e6; padding:1rem; border-radius:8px; white-space:pre-wrap; min-height: 160px; }
-    audio { display:block; margin: 1rem 0; width: 100%; }
-    label { display:inline-block; margin-right: .5rem; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    button { padding:10px 14px; font-size:14px; cursor:pointer; }
+    #log { white-space:pre-wrap; border:1px solid #ddd; padding:12px; margin-top:12px; height:200px; overflow:auto; }
+    #textout { border:1px solid #ddd; min-height:80px; padding:10px; margin-top:12px; }
   </style>
 </head>
 <body>
-  <h1>WebRTC AI Interview — PCB Designer</h1>
-  <p>Click Start to grant mic access. The AI will speak and listen in real time.</p>
-
+  <h1>WebRTC Interview (English-only)</h1>
   <div class="row">
-    <button id="start">Start Interview</button>
-    <button id="stop" disabled>Stop</button>
-    <label><input type="checkbox" id="textMode"> Also request text responses</label>
+    <button id="connect">Connect</button>
+    <button id="startInterview" disabled>Start Interview</button>
+    <button id="hangup" disabled>Hang Up</button>
   </div>
-
   <audio id="remoteAudio" autoplay></audio>
 
-  <h3>Console</h3>
+  <h3>Transcript</h3>
+  <div id="textout"></div>
+
+  <h3>Log</h3>
   <div id="log"></div>
 
-  <script>
-    const logEl = document.getElementById('log');
-    function log(s){ logEl.textContent += s + "\n"; }
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").textContent += msg + "\n"; };
+const appendText = (t) => { $("textout").textContent += t; };
 
-    let pc, localStream, eventsChannel, textChannel;
+let pc;
+let dc;
+let micStream;
 
-    async function startInterview() {
-      document.getElementById('start').disabled = true;
+async function getEphemeral() {
+  const r = await fetch("/session", { method: "POST" });
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error("Failed to create session: " + txt);
+  }
+  return await r.json(); // includes client_secret
+}
 
-      // 1) Fetch ephemeral token from your backend
-      let session;
-      try {
-        const r = await fetch('/session');
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        session = await r.json();
-      } catch (e) {
-        log("Failed to create session: " + e.message);
-        document.getElementById('start').disabled = false;
-        return;
-      }
+async function connect() {
+  $("connect").disabled = true;
+  $("startInterview").disabled = true;
+  $("hangup").disabled = false;
 
-      const token = session?.client_secret?.value;
-      const model = session?.model || "gpt-4o-realtime-preview";
-      if (!token) {
-        log("No ephemeral token in /session response.");
-        document.getElementById('start').disabled = false;
-        return;
-      }
-      log("Ephemeral token acquired.");
+  // 1) Get mic
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  log("Mic acquired.");
 
-      // 2) WebRTC peer connection
-      pc = new RTCPeerConnection({
-        // iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }]
-      });
+  // 2) New RTCPeerConnection
+  pc = new RTCPeerConnection();
+  micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
 
-      // Remote audio from model
-      const remoteAudio = document.getElementById('remoteAudio');
-      pc.ontrack = (e) => {
-        remoteAudio.srcObject = e.streams[0];
-      };
-
-      // Datachannel created by us → send events to model
-      eventsChannel = pc.createDataChannel("oai-events");
-      eventsChannel.onopen = () => {
-        log("Events channel open.");
-        // Kick off interview: ask model to start speaking
-        const wantText = document.getElementById('textMode').checked;
-        eventsChannel.send(JSON.stringify({
-          type: "response.create",
-          response: {
-            instructions: "Begin the interview now. Greet briefly and ask the first concise question on Ki Cad or Altium experience.",
-            modalities: wantText ? ["audio","text"] : ["audio"]
-          }
-        }));
-      };
-      eventsChannel.onmessage = (ev) => log("events ← " + ev.data);
-
-      // Optional: model may open its own channels; also we make one for plain text messages
-      pc.ondatachannel = (ev) => {
-        const ch = ev.channel;
-        // OpenAI typically names its event channel "oai-events" too, but handle all:
-        if (!textChannel && ch.label !== "oai-events") {
-          textChannel = ch;
-          textChannel.onmessage = (msg) => {
-            // If you asked for text modality, you'll see text chunks here
-            log("text ← " + msg.data);
-          };
-        }
-      };
-
-      // 3) Send mic to model
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch (e) {
-        log("Mic access denied: " + e.message);
-        document.getElementById('start').disabled = false;
-        return;
-      }
-      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-      // 4) Offer/Answer with OpenAI Realtime
-      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
-      await pc.setLocalDescription(offer);
-
-      const resp = await fetch(`https://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/sdp"
-        },
-        body: offer.sdp
-      });
-
-      if (!resp.ok) {
-        log("Realtime SDP failed: " + resp.status + " " + (await resp.text()));
-        document.getElementById('start').disabled = false;
-        return;
-      }
-
-      const answerSdp = await resp.text();
-      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-
-      log("Connected. Speak normally; the AI will respond in voice.");
-      document.getElementById('stop').disabled = false;
+  // Remote audio sink
+  const remoteAudio = $("remoteAudio");
+  pc.ontrack = (e) => {
+    // First audio track will be model's TTS stream
+    if (remoteAudio.srcObject !== e.streams[0]) {
+      remoteAudio.srcObject = e.streams[0];
     }
+  };
 
-    async function stopInterview() {
-      try { if (eventsChannel && eventsChannel.readyState === "open") eventsChannel.close(); } catch {}
-      try { if (textChannel && textChannel.readyState === "open") textChannel.close(); } catch {}
-      try { if (pc) await pc.close(); } catch {}
-      try { if (localStream) localStream.getTracks().forEach(t => t.stop()); } catch {}
-
-      document.getElementById('start').disabled = false;
-      document.getElementById('stop').disabled = true;
-      log("Stopped.");
+  // Data channel for text events (optional but handy)
+  dc = pc.createDataChannel("oai-events");
+  dc.onopen = () => log("DataChannel open.");
+  dc.onmessage = (ev) => {
+    try {
+      const msg = JSON.parse(ev.data);
+      // Stream partial/done text
+      if (msg.type === "response.output_text.delta") {
+        appendText(msg.delta);
+      } else if (msg.type === "response.output_text.done") {
+        appendText("\n");
+      } else if (msg.type === "error") {
+        log("[Model error] " + JSON.stringify(msg));
+      }
+    } catch {
+      // non-JSON messages (ignore)
     }
+  };
 
-    document.getElementById('start').onclick = startInterview;
-    document.getElementById('stop').onclick = stopInterview;
-  </script>
+  // 3) Create local offer
+  const offer = await pc.createOffer({
+    offerToReceiveAudio: true,
+    offerToReceiveVideo: false
+  });
+  await pc.setLocalDescription(offer);
+
+  // 4) Fetch ephemeral session and exchange SDP with OpenAI
+  const session = await getEphemeral();
+  const EPHEMERAL_KEY = session.client_secret && session.client_secret.value;
+  if (!EPHEMERAL_KEY) throw new Error("No client_secret in /session response.");
+
+  const url = "https://api.openai.com/v1/realtime?" + new URLSearchParams({
+    model: "gpt-4o-realtime-preview"
+  });
+
+  const resp = await fetch(url, {
+    method: "POST",
+    body: offer.sdp,
+    headers: {
+      "Authorization": "Bearer " + EPHEMERAL_KEY,
+      "Content-Type": "application/sdp",
+      "OpenAI-Beta": "realtime=v1"
+    }
+  });
+
+  if (!resp.ok) {
+    $("connect").disabled = false;
+    $("hangup").disabled = true;
+    throw new Error("SDP exchange failed: " + await resp.text());
+  }
+
+  const answerSDP = await resp.text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+  log("Connected to OpenAI Realtime.");
+
+  $("startInterview").disabled = false;
+}
+
+function sendRealtimeEvent(obj) {
+  // When the RTCPeerConnection is up, OpenAI exposes a data channel named "oai-events"
+  // On some builds the model creates the channel; on others, we do and we send/receive JSON there.
+  if (dc && dc.readyState === "open") {
+    dc.send(JSON.stringify(obj));
+  } else {
+    log("DataChannel not open; cannot send.");
+  }
+}
+
+function startInterview() {
+  // Ask for a concise, English-only first question + force audio+text
+  sendRealtimeEvent({
+    type: "response.create",
+    response: {
+      instructions: "Answer in English only.",
+      modalities: ["audio", "text"],
+      conversation: {
+        messages: [
+          { role: "system", content: "You are an interviewer for PCB designers. Keep questions concise." },
+          { role: "user", content: "Start with a short question about EDA tool experience (Ki Cad or Altium)." }
+        ]
+      }
+    }
+  });
+  log("Interview prompt sent.");
+}
+
+async function hangup() {
+  $("hangup").disabled = true;
+  $("startInterview").disabled = true;
+  $("connect").disabled = false;
+
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch {}
+  try { dc && dc.close(); } catch {}
+  try { pc && pc.close(); } catch {}
+  log("Disconnected.");
+}
+
+$("connect").onclick = () => connect().catch(e => { log(e.message); $("connect").disabled = false; });
+$("startInterview").onclick = startInterview;
+$("hangup").onclick = () => hangup();
+</script>
 </body>
 </html>
