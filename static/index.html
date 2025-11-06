@@ -1,107 +1,162 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <title>WebRTC Interview (Python)</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
-    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-    button { padding:10px 14px; font-size:14px; cursor:pointer; }
-    #log { white-space:pre-wrap; border:1px solid #ddd; padding:12px; margin-top:12px; height:200px; overflow:auto; }
-    #textout { border:1px solid #ddd; min-height:80px; padding:10px; margin-top:12px; }
-  </style>
+<meta charset="utf-8"/>
+<title>WebRTC Interview (Browser + Python server)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<style>
+  body { font-family: system-ui, Arial, sans-serif; margin: 24px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input, button { padding:10px; font-size:14px; }
+  #remoteAudio { margin-top: 12px; display:block; }
+  #log, #transcript { white-space:pre-wrap; border:1px solid #ddd; padding:10px; min-height:120px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { border: 1px solid #ddd; padding: 8px; vertical-align: top; }
+  th { background: #f5f5f5; }
+</style>
 </head>
 <body>
-  <h1>WebRTC Interview (English-only)</h1>
+  <h1>WebRTC Voice Interview</h1>
   <div class="row">
-    <button id="connect">Connect</button>
-    <button id="startInterview" disabled>Start Interview</button>
-    <button id="hangup" disabled>Hang Up</button>
+    <label>Role: <input id="role" value="PCB Designer" style="width:220px"/></label>
+    <label>Opening: <input id="opening" style="width:520px"
+      value="Tell me about your experience with Ki Cad or Altium for PCB design."/></label>
   </div>
+  <div class="row" style="margin-top:10px;">
+    <button id="connect">Connect</button>
+    <button id="hangup" disabled>Hang up</button>
+  </div>
+
   <audio id="remoteAudio" autoplay></audio>
 
-  <h3>Transcript</h3>
-  <div id="textout"></div>
+  <h3>Live Transcript (model text stream)</h3>
+  <div id="transcript"></div>
+
+  <h3>Turns (question / candidate transcript / analysis)</h3>
+  <table id="turns">
+    <thead><tr><th>#</th><th>Question (spoken)</th><th>Candidate Transcript</th><th>Analysis (JSON)</th></tr></thead>
+    <tbody id="turnBody"></tbody>
+  </table>
 
   <h3>Log</h3>
   <div id="log"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const log = (msg) => { $("log").textContent += msg + "\n"; };
-const appendText = (t) => { $("textout").textContent += t; };
+const log = (m) => { $("log").textContent += m + "\n"; };
+const appendTranscript = (t) => { $("transcript").textContent += t; };
 
-let pc;
-let dc;
-let micStream;
+let pc, dc, micStream, currentQuestion = "", turnIndex = 0;
+const turnRows = [];
 
-async function getEphemeral() {
-  const r = await fetch("/session", { method: "POST" });
-  if (!r.ok) {
-    const txt = await r.text();
-    throw new Error("Failed to create session: " + txt);
-  }
-  return await r.json(); // includes client_secret
+function addTurn(question, userTranscript, analysisJson) {
+  const row = document.createElement("tr");
+  row.innerHTML = `
+    <td>${++turnIndex}</td>
+    <td>${question || ""}</td>
+    <td>${userTranscript || ""}</td>
+    <td><pre style="margin:0;">${analysisJson ? JSON.stringify(analysisJson, null, 2) : ""}</pre></td>
+  `;
+  $("turnBody").appendChild(row);
+  turnRows.push({ question, userTranscript, analysisJson });
+}
+
+async function createSession(role, opening) {
+  const r = await fetch("/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role, opening })
+  });
+  if (!r.ok) throw new Error("Failed to create session: " + await r.text());
+  return await r.json();
 }
 
 async function connect() {
   $("connect").disabled = true;
-  $("startInterview").disabled = true;
   $("hangup").disabled = false;
+  $("transcript").textContent = "";
+  $("log").textContent = "";
+  $("turnBody").innerHTML = "";
+  turnIndex = 0;
 
-  // 1) Get mic
+  const role = $("role").value.trim();
+  const opening = $("opening").value.trim();
+
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  log("Mic acquired.");
+  log("Mic ready.");
 
-  // 2) New RTCPeerConnection
   pc = new RTCPeerConnection();
   micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
 
-  // Remote audio sink
   const remoteAudio = $("remoteAudio");
   pc.ontrack = (e) => {
-    // First audio track will be model's TTS stream
     if (remoteAudio.srcObject !== e.streams[0]) {
       remoteAudio.srcObject = e.streams[0];
     }
   };
 
-  // Data channel for text events (optional but handy)
+  // Data channel for model events (text/JSON)
   dc = pc.createDataChannel("oai-events");
   dc.onopen = () => log("DataChannel open.");
   dc.onmessage = (ev) => {
+    // Try to parse Realtime JSON events; fall back to plain text
     try {
       const msg = JSON.parse(ev.data);
-      // Stream partial/done text
+
+      // Text stream deltas
       if (msg.type === "response.output_text.delta") {
-        appendText(msg.delta);
-      } else if (msg.type === "response.output_text.done") {
-        appendText("\n");
-      } else if (msg.type === "error") {
+        appendTranscript(msg.delta);
+        // Try to detect the latest question text (spoken) heuristically:
+        currentQuestion += msg.delta;
+      }
+      else if (msg.type === "response.output_text.done") {
+        appendTranscript("\n");
+        // Look for [ANALYSIS_JSON] { ... }
+        const full = $("transcript").textContent;
+        const match = full.match(/\[ANALYSIS_JSON\]\s*({[\s\S]*?})/);
+        let analysis = null;
+        if (match) {
+          try { analysis = JSON.parse(match[1]); } catch {}
+        }
+
+        // The question is the last non-empty line BEFORE the analysis tag, strip noise:
+        const lines = full.split("\n").map(s => s.trim()).filter(Boolean);
+        let questionText = "";
+        if (lines.length) {
+          // Prefer the last line that does NOT start with [ANALYSIS_JSON]
+          for (let i = lines.length - 1; i >= 0; i--) {
+            if (!lines[i].startsWith("[ANALYSIS_JSON]")) {
+              questionText = lines[i];
+              break;
+            }
+          }
+        }
+
+        // Add a turn row with question (spoken). Transcript from user is captured by the model,
+        // but the Realtime API doesn't push a separate "user transcript" event.
+        // We approximate: when the model finishes, it had just listened to user's speech.
+        addTurn(questionText, "(captured from your voice)", analysis);
+
+        // Reset rolling question buffer
+        currentQuestion = "";
+      }
+      else if (msg.type === "error") {
         log("[Model error] " + JSON.stringify(msg));
       }
     } catch {
-      // non-JSON messages (ignore)
+      // Non-JSON message (rare), show it raw
+      appendTranscript(String(ev.data));
     }
   };
 
-  // 3) Create local offer
-  const offer = await pc.createOffer({
-    offerToReceiveAudio: true,
-    offerToReceiveVideo: false
-  });
+  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
   await pc.setLocalDescription(offer);
 
-  // 4) Fetch ephemeral session and exchange SDP with OpenAI
-  const session = await getEphemeral();
+  const session = await createSession(role, opening);
   const EPHEMERAL_KEY = session.client_secret && session.client_secret.value;
-  if (!EPHEMERAL_KEY) throw new Error("No client_secret in /session response.");
+  if (!EPHEMERAL_KEY) throw new Error("No client_secret in session response.");
 
-  const url = "https://api.openai.com/v1/realtime?" + new URLSearchParams({
-    model: "gpt-4o-realtime-preview"
-  });
-
+  const url = "https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview";
   const resp = await fetch(url, {
     method: "POST",
     body: offer.sdp,
@@ -111,51 +166,18 @@ async function connect() {
       "OpenAI-Beta": "realtime=v1"
     }
   });
-
   if (!resp.ok) {
     $("connect").disabled = false;
     $("hangup").disabled = true;
     throw new Error("SDP exchange failed: " + await resp.text());
   }
-
   const answerSDP = await resp.text();
   await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
-  log("Connected to OpenAI Realtime.");
-
-  $("startInterview").disabled = false;
-}
-
-function sendRealtimeEvent(obj) {
-  // When the RTCPeerConnection is up, OpenAI exposes a data channel named "oai-events"
-  // On some builds the model creates the channel; on others, we do and we send/receive JSON there.
-  if (dc && dc.readyState === "open") {
-    dc.send(JSON.stringify(obj));
-  } else {
-    log("DataChannel not open; cannot send.");
-  }
-}
-
-function startInterview() {
-  // Ask for a concise, English-only first question + force audio+text
-  sendRealtimeEvent({
-    type: "response.create",
-    response: {
-      instructions: "Answer in English only.",
-      modalities: ["audio", "text"],
-      conversation: {
-        messages: [
-          { role: "system", content: "You are an interviewer for PCB designers. Keep questions concise." },
-          { role: "user", content: "Start with a short question about EDA tool experience (Ki Cad or Altium)." }
-        ]
-      }
-    }
-  });
-  log("Interview prompt sent.");
+  log("Connected. The model will speak the opening question, then continue.");
 }
 
 async function hangup() {
   $("hangup").disabled = true;
-  $("startInterview").disabled = true;
   $("connect").disabled = false;
 
   try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch {}
@@ -165,7 +187,6 @@ async function hangup() {
 }
 
 $("connect").onclick = () => connect().catch(e => { log(e.message); $("connect").disabled = false; });
-$("startInterview").onclick = startInterview;
 $("hangup").onclick = () => hangup();
 </script>
 </body>
