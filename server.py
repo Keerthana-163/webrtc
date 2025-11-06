@@ -1,7 +1,7 @@
 import os
 from typing import Dict, Any
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 
@@ -10,10 +10,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY env var")
 
+# If your account doesn’t have access to the Realtime preview you picked,
+# you’ll get a 404/403 from OpenAI. Try another, e.g. "gpt-4o-realtime-preview".
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-4o-realtime-preview")
 VOICE = os.getenv("VOICE", "alloy")
 
-# Defaults mirroring your CLI
 DEFAULT_ROLE = os.getenv("ROLE", "PCB Designer")
 DEFAULT_OPENING = os.getenv(
     "OPENING_QUESTION",
@@ -27,11 +28,16 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 async def root():
     return FileResponse("static/index.html")
 
+@app.get("/health")
+async def health():
+    ok = bool(OPENAI_API_KEY)
+    return {"ok": ok, "model": REALTIME_MODEL, "voice": VOICE}
+
 @app.post("/session")
-async def create_ephemeral_session(req: Request) -> JSONResponse:
+async def create_ephemeral_session(req: Request):
     """
     Issues an ephemeral key for browser Realtime.
-    You can pass role/opening from the client if you want (optional).
+    Returns upstream errors verbatim so the client can display them.
     """
     try:
         body = await req.json()
@@ -41,10 +47,6 @@ async def create_ephemeral_session(req: Request) -> JSONResponse:
     role = (body.get("role") or DEFAULT_ROLE).strip()
     opening = (body.get("opening") or DEFAULT_OPENING).strip()
 
-    # The 'instructions' make the model follow your CLI logic:
-    # - Speak only the question (audio)
-    # - Put analysis in TEXT channel as JSON tagged block
-    # - Keep questions <20 words
     instructions = f"""
 You are a structured technical interviewer for the role: {role}.
 Rules:
@@ -62,14 +64,13 @@ No extra commentary outside JSON. Keep analysis concise (1–2 sentences).
         "instructions": instructions,
         "modalities": ["audio", "text"],
         "input_audio_transcription": {"model": "whisper-1", "language": "en"},
-    }
-
-    # Provide an initial user message so the first spoken output is your opening
-    # The Realtime session remembers history after connection.
-    payload["conversation"] = {
-        "messages": [
-            {"role": "user", "content": f"Start the interview. First question: {opening}"}
-        ]
+        "conversation": {
+            "messages": [
+                {"role": "user", "content": f"Start the interview. First question: {opening}"}
+            ]
+        },
+        # Optionally tighten TTL:
+        # "expires_in": 60,
     }
 
     headers = {
@@ -78,9 +79,27 @@ No extra commentary outside JSON. Keep analysis concise (1–2 sentences).
         "OpenAI-Beta": "realtime=v1",
     }
 
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        r = await client.post("https://api.openai.com/v1/realtime/sessions",
-                              json=payload, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-    return JSONResponse(data)
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/realtime/sessions",
+                json=payload,
+                headers=headers,
+            )
+    except httpx.RequestError as e:
+        # Network/SSL/DNS errors
+        return JSONResponse(
+            {"error": "request_error", "detail": str(e)},
+            status_code=502,
+        )
+
+    # Pass through OpenAI’s exact response if it’s not 2xx
+    if resp.status_code // 100 != 2:
+        # Try JSON; fall back to text
+        content_type = resp.headers.get("content-type", "")
+        if "application/json" in content_type:
+            return JSONResponse(resp.json(), status_code=resp.status_code)
+        else:
+            return PlainTextResponse(resp.text, status_code=resp.status_code)
+
+    return JSONResponse(resp.json())
